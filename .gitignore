@@ -491,3 +491,8 @@ pretrained/
 outputs/
 wandb/
 CLAUDE.md
+HANDOFF.md
+
+# Diagnostics — keep scripts/README, ignore output data
+diagnostics/output/
+diagnostics/*.json
