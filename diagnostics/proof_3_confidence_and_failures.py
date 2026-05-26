@@ -55,12 +55,18 @@ def parse_args():
     p.add_argument('--coco_val_ann', required=True,
                    help='OV-COCO val annotation JSON with novel/base split')
     p.add_argument('--img_dir', required=True)
-    p.add_argument('--output_dir', default='analysis_outputs')
+    p.add_argument('--output_dir', default='diagnostics/output')
     p.add_argument('--n_images', type=int, default=50,
                    help='Number of val images to run inference on')
     p.add_argument('--score_thresh', type=float, default=0.25,
                    help='Confidence threshold for showing detections')
     p.add_argument('--device', default='cuda')
+    p.add_argument('--run_label', default='published_ovdquo',
+                   help='Prefix for output filenames; lets multiple checkpoints coexist')
+    p.add_argument('--image_ids', default=None,
+                   help='Comma-separated COCO image IDs; if set, overrides random sampling')
+    p.add_argument('--annotation_source_note', default='',
+                   help='Free-text note recorded in the predictions JSON for provenance')
     return p.parse_args()
 
 # ── NOVEL CATEGORY INFO ───────────────────────────────────────
@@ -107,6 +113,9 @@ def load_model(config_path, checkpoint_path, device):
     cfg = SLConfig.fromfile(config_path)
     cfg.device = device
 
+    # 'analysis' is set by main.py's argparse but not present in config files
+    if not hasattr(cfg, 'analysis'):
+        cfg.analysis = False
     model, criterion, postprocessors = build_model_main(cfg)
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     model.load_state_dict(checkpoint['model'])
@@ -116,23 +125,18 @@ def load_model(config_path, checkpoint_path, device):
     return model, postprocessors, cfg
 
 
-def run_inference_batch(model, postprocessors, img_paths, device, cfg):
+def run_inference_batch(model, postprocessors, img_paths, device, category_list):
     import torch
     from PIL import Image
     import torchvision.transforms as T
 
+    # CLIP normalization — must match ov_coco.py make_coco_transforms val pipeline
     transform = T.Compose([
         T.Resize(800, max_size=1333),
         T.ToTensor(),
-        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        T.Normalize([0.48145466, 0.4578275, 0.40821073],
+                    [0.26862954, 0.26130258, 0.27577711]),
     ])
-
-    # Build category text embeddings the same way OV-DQUO eval does
-    import torch.nn.functional as F
-    classifier = model.classifier  # frozen CLIP text encoder output
-    # classifier is already the precomputed text embedding matrix [num_classes, D]
-    # Pass it as the categories argument
-    categories = classifier  # shape: [C, D], already on device after model.to(device)
 
     all_results = []
     for img_path in img_paths:
@@ -141,7 +145,7 @@ def run_inference_batch(model, postprocessors, img_paths, device, cfg):
         tensor = transform(img).unsqueeze(0).to(device)
 
         with torch.no_grad():
-            outputs = model(tensor, categories)
+            outputs = model(tensor, categories=category_list)
 
         target_sizes = torch.tensor([[h, w]], device=device)
         results = postprocessors["bbox"](outputs, target_sizes)
@@ -192,22 +196,34 @@ def main():
         return
 
     # ── Run inference ────────────────────────────────────────
-    import random
-    val_img_ids = list(img_info.keys())
-    random.shuffle(val_img_ids)
-    selected_ids = val_img_ids[:args.n_images]
+    if args.image_ids:
+        selected_ids = [int(x.strip()) for x in args.image_ids.split(',')]
+        missing = [iid for iid in selected_ids if iid not in img_info]
+        if missing:
+            raise ValueError(f"Image IDs not in annotations: {missing}")
+    else:
+        import random
+        val_img_ids = list(img_info.keys())
+        random.shuffle(val_img_ids)
+        selected_ids = val_img_ids[:args.n_images]
 
     img_paths = []
     for iid in selected_ids:
         fname = img_info[iid]['file_name']
         img_paths.append(Path(args.img_dir) / fname)
 
+    # Build category_list before inference — model.forward() expects list-of-strings
+    cat_id_to_name = {c['id']: c['name'] for c in ann_data.get('categories', [])}
+    # Row-index → COCO-ID mapping (mirrors OVCocoDetection.label2catid)
+    # Model output labels are row indices into category_list, NOT COCO category IDs.
+    _sorted_cat_ids = sorted(cat_id_to_name.keys())
+    category_list = [cat_id_to_name[k] for k in _sorted_cat_ids]
+    label2catid = {i: cid for i, cid in enumerate(_sorted_cat_ids)}
+
     print(f"Running inference on {len(img_paths)} images...")
-    results = run_inference_batch(model, postprocessors, img_paths, args.device, cfg)
+    results = run_inference_batch(model, postprocessors, img_paths, args.device, category_list)
 
     # ── Collect confidence scores by category type ───────────
-    # Build cat_id → name mapping
-    cat_id_to_name = {c['id']: c['name'] for c in ann_data.get('categories', [])}
 
     conf_base = []
     conf_novel_large = []   # novel, OLN-detectable
@@ -215,8 +231,9 @@ def main():
 
     for r in results:
         for score, label in zip(r['scores'], r['labels']):
-            cat_name = cat_id_to_name.get(int(label), '')
-            if int(label) in novel_ids:
+            coco_id = label2catid.get(int(label), int(label))
+            cat_name = cat_id_to_name.get(coco_id, '')
+            if coco_id in novel_ids:
                 if OLN_DETECTABLE.get(cat_name, True):
                     conf_novel_large.append(float(score))
                 else:
@@ -270,10 +287,10 @@ def main():
             bbox=dict(boxstyle='round', facecolor='#1A1A2E', edgecolor='#FF9944', alpha=0.8))
 
     plt.tight_layout()
-    plt.savefig(os.path.join(args.output_dir, "proof3a_confidence_distributions.png"),
+    plt.savefig(os.path.join(args.output_dir, f"{args.run_label}__proof3a_confidence_distributions.png"),
                 dpi=150, bbox_inches='tight', facecolor=BG)
     plt.close()
-    print(f"Saved: proof3a_confidence_distributions.png")
+    print(f"Saved: {args.run_label}__proof3a_confidence_distributions.png")
 
     # ── Plot 2: Failure case visualization ───────────────────
     # Find images where novel objects exist in GT but are missed by detector
@@ -289,8 +306,9 @@ def main():
         # Get detector predictions above threshold
         pred_novel_boxes = []
         for score, label, box in zip(r['scores'], r['labels'], r['boxes']):
-            if int(label) in novel_ids and float(score) >= args.score_thresh:
-                pred_novel_boxes.append((float(score), box))
+            coco_id = label2catid.get(int(label), int(label))
+            if coco_id in novel_ids and float(score) >= args.score_thresh:
+                pred_novel_boxes.append((float(score), coco_id, box))
 
         # Count missed GTs
         n_missed = 0
@@ -299,7 +317,7 @@ def main():
             gt_area = gt_box[2] * gt_box[3]
             # Check if any prediction overlaps
             matched = False
-            for score, pred_box in pred_novel_boxes:
+            for score, _lbl, pred_box in pred_novel_boxes:
                 # Simple IoU check
                 gx1, gy1 = gt_box[0], gt_box[1]
                 gx2, gy2 = gx1 + gt_box[2], gy1 + gt_box[3]
@@ -328,6 +346,41 @@ def main():
     failure_cases.sort(key=lambda x: x['n_missed'], reverse=True)
     print(f"  Found {len(failure_cases)} images with missed novel objects")
 
+    predictions_dump = {
+        "run_label": args.run_label,
+        "checkpoint": args.checkpoint,
+        "score_thresh": args.score_thresh,
+        "annotation_file": args.coco_val_ann,
+        "annotation_source_note": args.annotation_source_note,
+        "images": []
+    }
+    for r, iid in zip(results, selected_ids):
+        img_record = {
+            "image_id": int(iid),
+            "image_path": r["img_path"],
+            "image_size": list(r["img_size"]),
+            "predictions": [
+                {"label": label2catid.get(int(l), int(l)),
+                 "cat_name": cat_id_to_name.get(label2catid.get(int(l), int(l)), "?"),
+                 "score": float(s), "box": [float(v) for v in b]}
+                for s, l, b in zip(r["scores"], r["labels"], r["boxes"])
+                if float(s) >= args.score_thresh
+            ],
+            "novel_gt": [
+                {"cat_id": int(a["category_id"]),
+                 "cat_name": cat_id_to_name.get(a["category_id"], "?"),
+                 "bbox_xywh": list(a["bbox"])}
+                for a in gt_by_img.get(iid, [])
+                if a["category_id"] in novel_ids
+            ]
+        }
+        predictions_dump["images"].append(img_record)
+
+    json_path = os.path.join(args.output_dir, f"{args.run_label}__predictions.json")
+    with open(json_path, 'w') as f:
+        json.dump(predictions_dump, f, indent=2)
+    print(f"Saved: {json_path}")
+
     # Visualize top 6 failure cases
     n_show = min(6, len(failure_cases))
     if n_show == 0:
@@ -352,25 +405,27 @@ def main():
             draw.rectangle([x, y, x+w, y+h], outline='red', width=3)
             # draw.text((x, max(0, y-15)), f"GT: {cat_name}", fill='red')
             draw.text((x, max(0, y-28)), f"GT: {cat_name}", fill='red', font=font)
-            draw.text((px1, py1-28), f"{cat_name} {score:.2f}", fill='lime', font=font)
 
         # Draw predictions in green
-        for score, box in case['pred_novel']:
+        for score, label, box in case['pred_novel']:
             px1, py1, px2, py2 = box
+            pred_cat_name = cat_id_to_name.get(label, '?')
             draw.rectangle([px1, py1, px2, py2], outline='lime', width=2)
-            draw.text((px1, py1), f"{score:.2f}", fill='lime')
+            draw.text((px1, max(0, py1 - 28)),
+                      f"{pred_cat_name} {score:.2f}",
+                      fill='lime', font=font)
 
         ax.imshow(np.array(img))
         ax.set_title(f"Missed: {case['n_missed']} novel obj(s)\n"
-                     f"Categories: {', '.join(set(case['cat_names'])[:3])}",
+                     f"Categories: {', '.join(sorted(set(case['cat_names']))[:3])}",
                      color='white', fontsize=9)
         ax.axis('off')
 
     plt.tight_layout()
-    plt.savefig(os.path.join(args.output_dir, "proof3b_failure_cases.png"),
+    plt.savefig(os.path.join(args.output_dir, f"{args.run_label}__proof3b_failure_cases.png"),
                 dpi=120, bbox_inches='tight', facecolor=BG)
     plt.close()
-    print(f"Saved: proof3b_failure_cases.png")
+    print(f"Saved: {args.run_label}__proof3b_failure_cases.png")
     print("\nKey slide caption:")
     print("  'Red = GT novel objects. Green = OV-DQUO predictions.")
     print("   OLN never proposed pseudo-labels for these objects during training.")
