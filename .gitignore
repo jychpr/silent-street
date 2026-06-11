@@ -496,3 +496,6 @@ HANDOFF.md
 # Diagnostics — keep scripts/README, ignore output data
 diagnostics/output/
 diagnostics/*.json
+
+
+references/
