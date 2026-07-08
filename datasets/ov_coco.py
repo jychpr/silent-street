@@ -17,9 +17,18 @@ import datasets.transforms as T
 
 class OVCocoDetection(torchvision.datasets.CocoDetection):
     def __init__(
-        self, img_folder, ann_file, transforms, return_masks, pseudo_box
+        self, img_folder, ann_file, transforms, return_masks, pseudo_box, train_subset_ids=None
     ):
         super(OVCocoDetection, self).__init__(img_folder, ann_file)
+        # --- deviation #7: flag-gated subset iteration (default None = upstream behavior) ---
+        # When train_subset_ids is a JSON path, restrict self.ids to the sorted intersection
+        # with that file's image_ids. __getitem__ pseudo-box attachment is unchanged (abstained
+        # images still fall to GT-fallback). None => byte-identical full iteration.
+        if train_subset_ids is not None:
+            with open(train_subset_ids, "r") as f:
+                _subset_ids = set(json.load(f)["image_ids"])
+            self.ids = sorted(set(self.ids) & _subset_ids)
+        # --- end deviation #7 ---
         self._transforms = transforms
         self.all_categories = {
             k["id"]: k["name"] for k in self.coco.dataset["categories"]
@@ -225,5 +234,7 @@ def build(image_set, args):
         transforms=make_coco_transforms(image_set, args),
         return_masks=args.masks,
         pseudo_box=args.pseudo_box,
+        # deviation #7: subset iteration applies to TRAIN only (val must keep all 4836 imgs)
+        train_subset_ids=getattr(args, "train_subset_ids", None) if image_set == "train" else None,
     )
     return dataset

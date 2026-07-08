@@ -131,6 +131,7 @@ def _categorize(
     masks_full: torch.Tensor,
     masks_256:  torch.Tensor,
     iou_preds:  torch.Tensor,
+    return_parts: bool = False,
 ):
     """
     Eq.1: assign O/P/SP levels by area; pick best level by iou_pred score.
@@ -142,6 +143,11 @@ def _categorize(
 
     Returns 6-tuple: masks_O_full, masks_B_full, masks_O_256, masks_B_256,
                      scores_O, scores_B — each (N, ...).
+
+    If return_parts=True, additionally returns (masks_P_full, masks_SP_full) as
+    a 7th and 8th element (Eq.1 part-level order[:,1] and subpart-level
+    order[:,2]). The default 6-tuple path is byte-for-byte unchanged so existing
+    callers (Gate B/C) are unaffected — used by Gate E's USR (Eq.9).
     """
     N   = masks_full.shape[0]
     idx = torch.arange(N)
@@ -156,6 +162,12 @@ def _categorize(
     masks_B_256  = masks_256 [idx, best]           # (N, 256, 256)
     scores_O     = iou_preds [idx, order[:, 0]]   # (N,) predicted IoU for O level
     scores_B     = iou_preds [idx, best]           # (N,) predicted IoU for B level
+
+    if return_parts:
+        masks_P_full  = masks_full[idx, order[:, 1]]   # (N, H, W) — Eq.1 part level
+        masks_SP_full = masks_full[idx, order[:, 2]]   # (N, H, W) — Eq.1 subpart level
+        return (masks_O_full, masks_B_full, masks_O_256, masks_B_256,
+                scores_O, scores_B, masks_P_full, masks_SP_full)
 
     return masks_O_full, masks_B_full, masks_O_256, masks_B_256, scores_O, scores_B
 

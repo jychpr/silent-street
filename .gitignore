@@ -496,6 +496,7 @@ HANDOFF.md
 # Diagnostics — keep scripts/README, ignore output data
 diagnostics/output/
 diagnostics/*.json
-
+diagnostics/subset25/esam_work
+diagnostics/subset25/esam_work_smoke
 
 references/
